@@ -317,11 +317,19 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
     // Return partial results on error
   }
 
-  // Override agent endTimes with accurate queue-operation timestamps where available
+  // Resolve agent completion: prefer queue-operation timestamps (accurate for
+  // background agents), fall back to tool_result timestamps (inline agents).
+  // Status is deferred so background agents show ◐ until they truly finish.
   for (const [toolUseId, endTime] of queueCompletionMap) {
     const agent = agentMap.get(toolUseId);
     if (agent) {
       agent.endTime = endTime;
+      agent.status = 'completed';
+    }
+  }
+  for (const agent of agentMap.values()) {
+    if (agent.status === 'running' && agent.endTime) {
+      agent.status = 'completed';
     }
   }
   result.tools = Array.from(toolMap.values()).slice(-20);
@@ -383,6 +391,7 @@ function processEntry(
           description: (input?.description as string) ?? undefined,
           status: 'running',
           startTime: timestamp,
+          background: (input?.run_in_background as boolean) === true,
         };
         agentMap.set(block.id, agentEntry);
       } else if (block.name === 'TodoWrite') {
@@ -468,8 +477,7 @@ function processEntry(
       }
 
       const agent = agentMap.get(block.tool_use_id);
-      if (agent) {
-        agent.status = 'completed';
+      if (agent && !agent.background) {
         agent.endTime = timestamp;
       }
     }
