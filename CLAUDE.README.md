@@ -70,20 +70,6 @@ Tell the user:
 - Restart Claude Code to load the statusline config, then the HUD will appear
 - It shows: context usage, active tools, running agents, and todo progress
 
-### Step 6: Ask About Starring (Optional)
-
-Ask the user: "Would you like to star the repository to support the project?"
-
-Only if they explicitly agree, run:
-```bash
-if gh help repo 2>/dev/null | grep -q "star:"; then
-  gh repo star jarrodwatts/claude-hud
-else
-  gh api -X PUT /user/starred/jarrodwatts/claude-hud
-fi
-```
-
-Never run this automatically without user consent.
 
 </agent_workflow>
 
