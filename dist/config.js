@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import { getHudPluginDir } from './claude-config-dir.js';
 export const DEFAULT_ELEMENT_ORDER = [
     'project',
+    'addedDirs',
     'context',
     'usage',
     'promptCache',
@@ -12,6 +13,7 @@ export const DEFAULT_ELEMENT_ORDER = [
     'tools',
     'agents',
     'todos',
+    'sessionTime',
 ];
 export const DEFAULT_MERGE_GROUPS = [
     ['context', 'usage'],
@@ -23,6 +25,7 @@ export const DEFAULT_CONFIG = {
     showSeparators: false,
     pathLevels: 1,
     maxWidth: null,
+    forceMaxWidth: false,
     elementOrder: [...DEFAULT_ELEMENT_ORDER],
     gitStatus: {
         enabled: true,
@@ -36,6 +39,8 @@ export const DEFAULT_CONFIG = {
     display: {
         showModel: true,
         showProject: true,
+        showAddedDirs: true,
+        addedDirsLayout: 'inline',
         showContextBar: true,
         contextValue: 'percent',
         showConfigCounts: false,
@@ -44,6 +49,7 @@ export const DEFAULT_CONFIG = {
         showSpeed: false,
         showTokenBreakdown: true,
         showUsage: true,
+        usageValue: 'percent',
         usageBarEnabled: true,
         showResetLabel: true,
         usageCompact: false,
@@ -58,6 +64,8 @@ export const DEFAULT_CONFIG = {
         promptCacheTtlSeconds: 300,
         showSessionTokens: false,
         showOutputStyle: false,
+        showSessionStartDate: false,
+        showLastResponseAt: false,
         mergeGroups: DEFAULT_MERGE_GROUPS.map(group => [...group]),
         autocompactBuffer: 'enabled',
         contextWarningThreshold: 70,
@@ -84,6 +92,8 @@ export const DEFAULT_CONFIG = {
         gitBranch: 'cyan',
         label: 'dim',
         custom: 208,
+        barFilled: '█',
+        barEmpty: '░',
     },
 };
 export function getConfigPath() {
@@ -105,6 +115,9 @@ function validateGitBranchOverflow(value) {
 function validateContextValue(value) {
     return value === 'percent' || value === 'tokens' || value === 'remaining' || value === 'both';
 }
+function validateUsageValue(value) {
+    return value === 'percent' || value === 'remaining';
+}
 function validateLanguage(value) {
     return value === 'en' || value === 'zh';
 }
@@ -123,6 +136,19 @@ function validateColorName(value) {
         || value === 'cyan'
         || value === 'brightBlue'
         || value === 'brightMagenta';
+}
+const UNSAFE_CODEPOINT = /[\p{Cc}\p{Cf}\p{Variation_Selector}\p{Zl}\p{Zp}\p{Cn}]/u;
+function validateBarChar(value) {
+    if (typeof value !== 'string' || value.length === 0)
+        return false;
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    if (Array.from(segmenter.segment(value)).length !== 1)
+        return false;
+    for (const ch of value) {
+        if (UNSAFE_CODEPOINT.test(ch))
+            return false;
+    }
+    return true;
 }
 const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 function validateColorValue(value) {
@@ -270,6 +296,9 @@ export function mergeConfig(userConfig) {
         ? Math.floor(rawMaxWidth)
         : null;
     const elementOrder = validateElementOrder(migrated.elementOrder);
+    const forceMaxWidth = typeof migrated.forceMaxWidth === 'boolean'
+        ? migrated.forceMaxWidth
+        : DEFAULT_CONFIG.forceMaxWidth;
     const gitStatus = {
         enabled: typeof migrated.gitStatus?.enabled === 'boolean'
             ? migrated.gitStatus.enabled
@@ -296,6 +325,12 @@ export function mergeConfig(userConfig) {
         showProject: typeof migrated.display?.showProject === 'boolean'
             ? migrated.display.showProject
             : DEFAULT_CONFIG.display.showProject,
+        showAddedDirs: typeof migrated.display?.showAddedDirs === 'boolean'
+            ? migrated.display.showAddedDirs
+            : DEFAULT_CONFIG.display.showAddedDirs,
+        addedDirsLayout: (migrated.display?.addedDirsLayout === 'inline' || migrated.display?.addedDirsLayout === 'line')
+            ? migrated.display.addedDirsLayout
+            : DEFAULT_CONFIG.display.addedDirsLayout,
         showContextBar: typeof migrated.display?.showContextBar === 'boolean'
             ? migrated.display.showContextBar
             : DEFAULT_CONFIG.display.showContextBar,
@@ -320,6 +355,9 @@ export function mergeConfig(userConfig) {
         showUsage: typeof migrated.display?.showUsage === 'boolean'
             ? migrated.display.showUsage
             : DEFAULT_CONFIG.display.showUsage,
+        usageValue: validateUsageValue(migrated.display?.usageValue)
+            ? migrated.display.usageValue
+            : DEFAULT_CONFIG.display.usageValue,
         usageBarEnabled: typeof migrated.display?.usageBarEnabled === 'boolean'
             ? migrated.display.usageBarEnabled
             : DEFAULT_CONFIG.display.usageBarEnabled,
@@ -360,6 +398,12 @@ export function mergeConfig(userConfig) {
         showOutputStyle: typeof migrated.display?.showOutputStyle === 'boolean'
             ? migrated.display.showOutputStyle
             : DEFAULT_CONFIG.display.showOutputStyle,
+        showSessionStartDate: typeof migrated.display?.showSessionStartDate === 'boolean'
+            ? migrated.display.showSessionStartDate
+            : DEFAULT_CONFIG.display.showSessionStartDate,
+        showLastResponseAt: typeof migrated.display?.showLastResponseAt === 'boolean'
+            ? migrated.display.showLastResponseAt
+            : DEFAULT_CONFIG.display.showLastResponseAt,
         mergeGroups: validateMergeGroups(migrated.display?.mergeGroups),
         autocompactBuffer: validateAutocompactBuffer(migrated.display?.autocompactBuffer)
             ? migrated.display.autocompactBuffer
@@ -418,8 +462,14 @@ export function mergeConfig(userConfig) {
         custom: validateColorValue(migrated.colors?.custom)
             ? migrated.colors.custom
             : DEFAULT_CONFIG.colors.custom,
+        barFilled: validateBarChar(migrated.colors?.barFilled)
+            ? migrated.colors.barFilled
+            : DEFAULT_CONFIG.colors.barFilled,
+        barEmpty: validateBarChar(migrated.colors?.barEmpty)
+            ? migrated.colors.barEmpty
+            : DEFAULT_CONFIG.colors.barEmpty,
     };
-    return { language, lineLayout, showSeparators, pathLevels, maxWidth, elementOrder, gitStatus, display, colors };
+    return { language, lineLayout, showSeparators, pathLevels, maxWidth, forceMaxWidth, elementOrder, gitStatus, display, colors };
 }
 export async function loadConfig() {
     const configPath = getConfigPath();
