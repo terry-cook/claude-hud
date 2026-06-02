@@ -78,7 +78,13 @@ interface TranscriptCacheFile {
   data: SerializedTranscriptData;
 }
 
-const TRANSCRIPT_CACHE_VERSION = 6;
+const TRANSCRIPT_CACHE_VERSION = 7;
+
+// Hard cap on the advisor model ID captured from the transcript. Real Claude
+// model IDs (e.g. "claude-haiku-4-5-20251001") fit comfortably under this; the
+// cap exists to prevent a malformed transcript from persisting an oversized
+// string through the JSON cache and onto every statusline refresh.
+const ADVISOR_MODEL_MAX_LEN = 64;
 
 let createReadStreamImpl: typeof fs.createReadStream = fs.createReadStream;
 
@@ -174,7 +180,9 @@ function deserializeTranscriptData(data: SerializedTranscriptData): TranscriptDa
     sessionTokens: normalizeSessionTokens(data.sessionTokens),
     lastCompactBoundaryAt: data.lastCompactBoundaryAt ? new Date(data.lastCompactBoundaryAt) : undefined,
     lastCompactPostTokens: typeof data.lastCompactPostTokens === 'number' ? data.lastCompactPostTokens : undefined,
-    advisorModel: typeof data.advisorModel === 'string' ? data.advisorModel : undefined,
+    advisorModel: typeof data.advisorModel === 'string' && data.advisorModel.length > 0
+      ? data.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN)
+      : undefined,
   };
 }
 
@@ -283,10 +291,17 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
           latestSlug = entry.slug;
         }
         // Capture the advisor model from the top-level `advisorModel` field.
-        // Claude Code stamps this onto every assistant record after `/advisor`
-        // is set, so the most recent occurrence reflects the current choice.
-        if (typeof entry.advisorModel === 'string' && entry.advisorModel.length > 0) {
-          latestAdvisorModel = entry.advisorModel;
+        // Claude Code stamps this onto every *assistant* record after `/advisor`
+        // is set, so we restrict to that record type (matching the documented
+        // source) and the most recent occurrence reflects the current choice.
+        // Length is hard-capped so a malformed transcript cannot persist an
+        // unbounded value through the cache layer.
+        if (
+          entry.type === 'assistant'
+          && typeof entry.advisorModel === 'string'
+          && entry.advisorModel.length > 0
+        ) {
+          latestAdvisorModel = entry.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN);
         }
         // Accumulate token usage from assistant messages.
         // Claude Code can write the same API response to the transcript 2-3 times

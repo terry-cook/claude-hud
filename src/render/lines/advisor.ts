@@ -1,8 +1,15 @@
 import type { RenderContext } from '../../types.js';
 import { label } from '../colors.js';
 import { t } from '../../i18n/index.js';
+import { sanitize as sanitizeDisplayText } from './added-dirs.js';
 
 const ADVISOR_ID_PATTERN = /^(?:claude-)?(opus|sonnet|haiku)-(\d+)-(\d+)/i;
+
+// Hard cap on the visible advisor segment so a malformed transcript or
+// override cannot grow into an oversized recurring statusline part.
+// 64 leaves headroom for "Advisor: " prefix on narrow terminals while still
+// fitting any realistic model name (e.g. "claude-haiku-4-5-20251001" = 25).
+const MAX_ADVISOR_DISPLAY_LEN = 64;
 
 /**
  * Prettifies a raw advisor model ID (as captured from the transcript) into a
@@ -35,16 +42,24 @@ export function prettifyAdvisorId(rawId: string): string {
   return id.replace(/^claude-/i, '');
 }
 
+function safeAdvisorText(input: string | null | undefined): string {
+  if (typeof input !== 'string') {
+    return '';
+  }
+  // Strip control + bidi + ANSI ESC bytes (sanitizeDisplayText handles all of
+  // U+0000-U+001F including ESC, so OSC/CSI/SS3 sequences lose their lead
+  // byte and the remainder renders as inert plain text), then cap length.
+  return sanitizeDisplayText(input.trim()).slice(0, MAX_ADVISOR_DISPLAY_LEN);
+}
+
 export function renderAdvisorLine(ctx: RenderContext): string | null {
   const display = ctx.config?.display;
   if (display?.showAdvisor !== true) {
     return null;
   }
 
-  const override = typeof display.advisorOverride === 'string'
-    ? display.advisorOverride.trim()
-    : '';
-  const transcriptValue = ctx.transcript?.advisorModel?.trim() ?? '';
+  const override = safeAdvisorText(display.advisorOverride);
+  const transcriptValue = safeAdvisorText(ctx.transcript?.advisorModel);
 
   const rawValue = override.length > 0 ? override : transcriptValue;
   if (!rawValue) {
@@ -52,10 +67,13 @@ export function renderAdvisorLine(ctx: RenderContext): string | null {
   }
 
   const pretty = override.length > 0 ? rawValue : prettifyAdvisorId(rawValue);
-  if (!pretty) {
+  // Defence-in-depth: re-sanitize and re-cap after prettifying in case any
+  // future change to the prettifier reflects raw input bytes through.
+  const safePretty = safeAdvisorText(pretty);
+  if (!safePretty) {
     return null;
   }
 
   const colors = ctx.config?.colors;
-  return `${label(`${t('label.advisor')}:`, colors)} ${pretty}`;
+  return `${label(`${t('label.advisor')}:`, colors)} ${safePretty}`;
 }
