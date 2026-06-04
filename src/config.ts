@@ -444,10 +444,10 @@ function validateNonNegativeInteger(value: unknown, fallback: number): number {
 }
 
 function validateAutoCompactWindow(value: unknown): number | null {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
     return null;
   }
-  return Math.floor(value);
+  return value;
 }
 
 function validateOptionalPath(value: unknown): string {

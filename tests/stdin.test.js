@@ -135,7 +135,7 @@ test('context percents clamp autoCompactWindow usage to 100', () => {
 });
 
 test('mergeConfig validates display.autoCompactWindow', () => {
-  for (const value of [0, -5, Number.NaN, 'abc']) {
+  for (const value of [0, -5, 0.5, 200000.5, Number.NaN, 'abc']) {
     assert.equal(mergeConfig({ display: { autoCompactWindow: value } }).display.autoCompactWindow, null);
   }
 
