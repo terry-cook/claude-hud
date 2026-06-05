@@ -3,7 +3,6 @@
 一个 Claude Code 插件，实时显示正在发生的事情——上下文使用率、活跃工具、运行中的 Agent 和待办进度。始终在你的输入下方可见。
 
 [![License](https://img.shields.io/github/license/jarrodwatts/claude-hud?v=2)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/jarrodwatts/claude-hud)](https://github.com/jarrodwatts/claude-hud/stargazers)
 
 ![Claude HUD in action](claude-hud-preview-5-2.png)
 
@@ -15,7 +14,7 @@
 
 **步骤 1：添加市场**
 ```
-/plugin marketplace add jarrodwatts/claude-hud
+/plugin marketplace add terry-cook/claude-hud
 ```
 
 **步骤 2：安装插件**
@@ -383,8 +382,3 @@ npm test
 
 MIT — 详见 [LICENSE](LICENSE)
 
----
-
-## Star 历史
-
-[![Star History Chart](https://api.star-history.com/svg?repos=jarrodwatts/claude-hud&type=Date)](https://star-history.com/#jarrodwatts/claude-hud&Date)
