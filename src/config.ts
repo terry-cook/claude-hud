@@ -19,7 +19,8 @@ export type GitBranchOverflowMode = 'truncate' | 'wrap';
  *   short:   Strip context suffix AND "Claude " prefix (e.g. "Opus 4.6")
  */
 export type ModelFormatMode = 'full' | 'compact' | 'short';
-export type TimeFormatMode = 'relative' | 'absolute' | 'both';
+export type TimeFormatMode = 'relative' | 'absolute' | 'both' | 'elapsed' | 'elapsedAndAbsolute';
+export type CustomLinePosition = 'first' | 'last';
 export type HudElement = 'project' | 'addedDirs' | 'context' | 'usage' | 'promptCache' | 'memory' | 'environment' | 'tools' | 'agents' | 'todos' | 'sessionTime';
 
 export type AddedDirsLayout = 'inline' | 'line';
@@ -107,6 +108,8 @@ export interface HudConfig {
     showResetLabel: boolean;
     usageCompact: boolean;
     showTools: boolean;
+    toolNameMaxLength: number;
+    toolsMaxVisible: number;
     showAgents: boolean;
     showTodos: boolean;
     showSessionName: boolean;
@@ -127,11 +130,22 @@ export interface HudConfig {
     sevenDayThreshold: number;
     environmentThreshold: number;
     externalUsagePath: string;
+    externalUsageWritePath: string;
     externalUsageFreshnessMs: number;
     modelFormat: ModelFormatMode;
     modelOverride: string;
     customLine: string;
+    customLinePosition: CustomLinePosition;
     timeFormat: TimeFormatMode;
+    // Show the advisor model when `/advisor` is configured for the session.
+    // The model ID is read from the transcript (see TranscriptData.advisorModel)
+    // so it reflects the actual current choice, not a global default.
+    showAdvisor: boolean;
+    // Optional manual override for the displayed advisor name. When set,
+    // suppresses transcript-driven detection — useful if the user wants a
+    // shorter label or transcript has not been written yet.
+    advisorOverride: string;
+    autoCompactWindow: number | null;
   };
   colors: HudColorOverrides;
 }
@@ -171,6 +185,8 @@ export const DEFAULT_CONFIG: HudConfig = {
     showResetLabel: true,
     usageCompact: false,
     showTools: false,
+    toolNameMaxLength: 0,
+    toolsMaxVisible: 4,
     showAgents: false,
     showTodos: false,
     showSessionName: false,
@@ -191,11 +207,16 @@ export const DEFAULT_CONFIG: HudConfig = {
     sevenDayThreshold: 80,
     environmentThreshold: 0,
     externalUsagePath: '',
+    externalUsageWritePath: '',
     externalUsageFreshnessMs: 300000,
     modelFormat: 'full',
     modelOverride: '',
     customLine: '',
+    customLinePosition: 'last',
     timeFormat: 'relative',
+    showAdvisor: false,
+    advisorOverride: '',
+    autoCompactWindow: null,
   },
   colors: {
     context: 'green',
@@ -244,7 +265,7 @@ function validateUsageValue(value: unknown): value is UsageValueMode {
 }
 
 function validateLanguage(value: unknown): value is Language {
-  return value === 'en' || value === 'zh';
+  return value === 'en' || value === 'zh' || value === 'zh-Hans';
 }
 
 function validateModelFormat(value: unknown): value is ModelFormatMode {
@@ -252,7 +273,15 @@ function validateModelFormat(value: unknown): value is ModelFormatMode {
 }
 
 function validateTimeFormat(value: unknown): value is TimeFormatMode {
-  return value === 'relative' || value === 'absolute' || value === 'both';
+  return value === 'relative'
+    || value === 'absolute'
+    || value === 'both'
+    || value === 'elapsed'
+    || value === 'elapsedAndAbsolute';
+}
+
+function validateCustomLinePosition(value: unknown): value is CustomLinePosition {
+  return value === 'first' || value === 'last';
 }
 
 function validateColorName(value: unknown): value is HudColorName {
@@ -417,6 +446,20 @@ function validateDurationSeconds(value: unknown, fallback: number): number {
   return Math.floor(value);
 }
 
+function validateNonNegativeInteger(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return fallback;
+  }
+  return value;
+}
+
+function validateAutoCompactWindow(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
 function validateOptionalPath(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -528,6 +571,14 @@ export function mergeConfig(userConfig: Partial<HudConfig>): HudConfig {
     showTools: typeof migrated.display?.showTools === 'boolean'
       ? migrated.display.showTools
       : DEFAULT_CONFIG.display.showTools,
+    toolNameMaxLength: validateNonNegativeInteger(
+      migrated.display?.toolNameMaxLength,
+      DEFAULT_CONFIG.display.toolNameMaxLength,
+    ),
+    toolsMaxVisible: validateNonNegativeInteger(
+      migrated.display?.toolsMaxVisible,
+      DEFAULT_CONFIG.display.toolsMaxVisible,
+    ),
     showAgents: typeof migrated.display?.showAgents === 'boolean'
       ? migrated.display.showAgents
       : DEFAULT_CONFIG.display.showAgents,
@@ -581,6 +632,7 @@ export function mergeConfig(userConfig: Partial<HudConfig>): HudConfig {
     sevenDayThreshold: validateThreshold(migrated.display?.sevenDayThreshold, 100),
     environmentThreshold: validateThreshold(migrated.display?.environmentThreshold, 100),
     externalUsagePath: validateOptionalPath(migrated.display?.externalUsagePath),
+    externalUsageWritePath: validateOptionalPath(migrated.display?.externalUsageWritePath),
     externalUsageFreshnessMs: validateFreshnessMs(migrated.display?.externalUsageFreshnessMs),
     modelFormat: validateModelFormat(migrated.display?.modelFormat)
       ? migrated.display.modelFormat
@@ -591,9 +643,19 @@ export function mergeConfig(userConfig: Partial<HudConfig>): HudConfig {
     customLine: typeof migrated.display?.customLine === 'string'
       ? migrated.display.customLine.slice(0, 80)
       : DEFAULT_CONFIG.display.customLine,
+    customLinePosition: validateCustomLinePosition(migrated.display?.customLinePosition)
+      ? migrated.display.customLinePosition
+      : DEFAULT_CONFIG.display.customLinePosition,
     timeFormat: validateTimeFormat(migrated.display?.timeFormat)
       ? migrated.display.timeFormat
       : DEFAULT_CONFIG.display.timeFormat,
+    showAdvisor: typeof migrated.display?.showAdvisor === 'boolean'
+      ? migrated.display.showAdvisor
+      : DEFAULT_CONFIG.display.showAdvisor,
+    advisorOverride: typeof migrated.display?.advisorOverride === 'string'
+      ? migrated.display.advisorOverride.slice(0, 80)
+      : DEFAULT_CONFIG.display.advisorOverride,
+    autoCompactWindow: validateAutoCompactWindow(migrated.display?.autoCompactWindow),
   };
 
   const colors = {
