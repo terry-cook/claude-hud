@@ -9,6 +9,7 @@ import { renderAdvisorLine } from './advisor.js';
 import { normalizeAddedDirs, sanitize as sanitizeDisplayText, basenameOf, truncateBasename, MAX_RENDERED_ADDED_DIRS } from './added-dirs.js';
 import { getFileHref, safeHyperlink } from '../../utils/hyperlinks.js';
 import { formatModelDisplay } from '../model-display.js';
+import { formatAuthSegment } from '../../auth.js';
 function resolvePathWithinCwd(cwd, candidatePath) {
     const resolvedCwd = path.resolve(cwd);
     const resolvedPath = path.resolve(cwd, candidatePath);
@@ -120,7 +121,7 @@ export function renderProjectLine(ctx) {
     if (ctx.extraLabel) {
         parts.push(label(ctx.extraLabel, colors));
     }
-    if (display?.showDuration !== false && ctx.sessionDuration) {
+    if (display?.showDuration === true && ctx.sessionDuration) {
         parts.push(label(`⏱️  ${ctx.sessionDuration}`, colors));
     }
     const costEstimate = renderCostEstimate(ctx);
@@ -132,6 +133,10 @@ export function renderProjectLine(ctx) {
         if (speed !== null) {
             parts.push(label(`${t('format.out')}: ${speed.toFixed(1)} ${t('format.tokPerSec')}`, colors));
         }
+    }
+    const authSegment = formatAuthSegment(ctx.authInfo, display);
+    if (authSegment) {
+        parts.push(label(authSegment, colors));
     }
     if (customLine && customLinePosition === 'last') {
         parts.push(customColor(customLine, colors));

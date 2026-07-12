@@ -66,6 +66,9 @@ export const DEFAULT_CONFIG = {
         showAgents: false,
         showTodos: false,
         showSessionName: false,
+        showAuth: false,
+        showAuthUser: false,
+        authUserLength: 8,
         showClaudeCodeVersion: false,
         showEffortLevel: false,
         showMemoryUsage: false,
@@ -426,6 +429,13 @@ export function mergeConfig(userConfig) {
         showSessionName: typeof migrated.display?.showSessionName === 'boolean'
             ? migrated.display.showSessionName
             : DEFAULT_CONFIG.display.showSessionName,
+        showAuth: typeof migrated.display?.showAuth === 'boolean'
+            ? migrated.display.showAuth
+            : DEFAULT_CONFIG.display.showAuth,
+        showAuthUser: typeof migrated.display?.showAuthUser === 'boolean'
+            ? migrated.display.showAuthUser
+            : DEFAULT_CONFIG.display.showAuthUser,
+        authUserLength: validateNonNegativeInteger(migrated.display?.authUserLength, DEFAULT_CONFIG.display.authUserLength),
         showClaudeCodeVersion: typeof migrated.display?.showClaudeCodeVersion === 'boolean'
             ? migrated.display.showClaudeCodeVersion
             : DEFAULT_CONFIG.display.showClaudeCodeVersion,

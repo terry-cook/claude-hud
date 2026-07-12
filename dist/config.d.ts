@@ -79,6 +79,9 @@ export interface HudConfig {
         showAgents: boolean;
         showTodos: boolean;
         showSessionName: boolean;
+        showAuth: boolean;
+        showAuthUser: boolean;
+        authUserLength: number;
         showClaudeCodeVersion: boolean;
         showEffortLevel: boolean;
         showMemoryUsage: boolean;

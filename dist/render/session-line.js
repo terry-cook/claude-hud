@@ -10,9 +10,10 @@ import { renderAdvisorLine } from './lines/advisor.js';
 import { t } from '../i18n/index.js';
 import { formatResetTime } from './format-reset-time.js';
 import { formatTokens, formatContextValue } from '../utils/format.js';
+import { formatAuthSegment } from '../auth.js';
 import { createDebug } from '../debug.js';
 import { formatModelDisplay } from './model-display.js';
-const debug = createDebug('context');
+const debug = createDebug('session-line');
 /**
  * Renders the full session line (model + context bar + project + git + counts + usage + duration).
  * Used for compact layout mode.
@@ -131,7 +132,7 @@ export function renderSessionLine(ctx) {
         parts.push(label(`CC v${ctx.claudeCodeVersion}`, colors));
     }
     // Config counts (respects environmentThreshold)
-    if (display?.showConfigCounts !== false) {
+    if (display?.showConfigCounts === true) {
         const totalCounts = ctx.claudeMdCount + ctx.rulesCount + ctx.mcpCount + ctx.hooksCount;
         const envThreshold = display?.environmentThreshold ?? 0;
         if (totalCounts > 0 && totalCounts >= envThreshold) {
@@ -279,7 +280,7 @@ export function renderSessionLine(ctx) {
             parts.push(advisorLine);
         }
     }
-    if (display?.showDuration !== false && ctx.sessionDuration) {
+    if (display?.showDuration === true && ctx.sessionDuration) {
         parts.push(label(`⏱️  ${ctx.sessionDuration}`, colors));
     }
     const sessionTimeLine = renderSessionTimeLine(ctx);
@@ -302,6 +303,10 @@ export function renderSessionLine(ctx) {
     }
     if (ctx.extraLabel) {
         parts.push(label(ctx.extraLabel, colors));
+    }
+    const authSegment = formatAuthSegment(ctx.authInfo, display);
+    if (authSegment) {
+        parts.push(label(authSegment, colors));
     }
     if (customLine && customLinePosition === 'last') {
         parts.push(customColor(customLine, colors));
