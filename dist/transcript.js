@@ -7,7 +7,7 @@ import { getHudPluginDir } from './claude-config-dir.js';
 import { createDebug } from './debug.js';
 import { sanitizeDisplayText } from './utils/sanitize.js';
 const debug = createDebug('transcript');
-const TRANSCRIPT_CACHE_VERSION = 10;
+const TRANSCRIPT_CACHE_VERSION = 11;
 const MCP_TOOL_NAME_PATTERN = /^mcp__(.+?)__(.+)$/;
 const ACTIVITY_NAME_MAX_LEN = 64;
 const MESSAGE_ID_MAX_LEN = 128;
@@ -132,6 +132,7 @@ function serializeTranscriptData(data) {
         lastCompactPostTokens: data.lastCompactPostTokens,
         compactionCount: data.compactionCount,
         advisorModel: data.advisorModel,
+        ultracodeActive: data.ultracodeActive,
     };
 }
 function deserializeTranscriptData(data) {
@@ -161,6 +162,7 @@ function deserializeTranscriptData(data) {
         advisorModel: typeof data.advisorModel === 'string' && data.advisorModel.length > 0
             ? data.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN)
             : undefined,
+        ultracodeActive: typeof data.ultracodeActive === 'boolean' ? data.ultracodeActive : undefined,
     };
 }
 function readTranscriptCache(transcriptPath, state) {
@@ -245,6 +247,7 @@ export async function parseTranscript(transcriptPath) {
     let latestSlug;
     let customTitle;
     let latestAdvisorModel;
+    let latestUltracodeActive;
     let lastCompactBoundaryAt;
     let lastCompactPostTokens;
     let compactionCount = 0;
@@ -286,6 +289,29 @@ export async function parseTranscript(transcriptPath) {
                     && typeof entry.advisorModel === 'string'
                     && entry.advisorModel.length > 0) {
                     latestAdvisorModel = entry.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN);
+                }
+                // Current ultracode state, distinguishable only from the transcript
+                // (stdin reports it as plain `xhigh`). Two signals update this in file
+                // order, last wins: the self-correcting ultra_effort_enter/exit
+                // attachment (can lag a turn) and the immediate `/effort` command output.
+                if (entry.type === 'attachment') {
+                    const attachmentType = entry.attachment?.type;
+                    if (attachmentType === 'ultra_effort_enter') {
+                        latestUltracodeActive = true;
+                    }
+                    else if (attachmentType === 'ultra_effort_exit') {
+                        latestUltracodeActive = false;
+                    }
+                }
+                // The `/effort` command-output signal. Anchored at the start of a *user*
+                // record's string content, so prose quoting the phrase can't flip state.
+                // Brittle by necessity — couples to Claude Code's /effort wording; if that
+                // changes, the label falls back to the (laggier) attachments.
+                if (entry.type === 'user' && typeof entry.message?.content === 'string') {
+                    const effortCommandMatch = entry.message.content.match(/^<local-command-stdout>Set effort level to (\w+)/);
+                    if (effortCommandMatch) {
+                        latestUltracodeActive = effortCommandMatch[1].toLowerCase() === 'ultracode';
+                    }
                 }
                 // Accumulate token usage from assistant messages.
                 // Claude Code can write the same API response to the transcript 2-3 times
@@ -389,6 +415,7 @@ export async function parseTranscript(transcriptPath) {
     result.lastCompactPostTokens = lastCompactPostTokens;
     result.compactionCount = compactionCount;
     result.advisorModel = latestAdvisorModel;
+    result.ultracodeActive = latestUltracodeActive;
     if (parsedCleanly) {
         writeTranscriptCache(canonicalTranscriptPath, transcriptState, result);
     }
