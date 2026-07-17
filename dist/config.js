@@ -2,6 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { getHudPluginDir } from './claude-config-dir.js';
+import { createDebug } from './debug.js';
+const debug = createDebug('config');
 export const DEFAULT_ELEMENT_ORDER = [
     'project',
     'addedDirs',
@@ -11,6 +13,8 @@ export const DEFAULT_ELEMENT_ORDER = [
     'memory',
     'environment',
     'tools',
+    'skills',
+    'mcp',
     'agents',
     'todos',
     'sessionTime',
@@ -45,6 +49,7 @@ export const DEFAULT_CONFIG = {
         contextValue: 'percent',
         showConfigCounts: false,
         showCost: false,
+        showRoutedCost: false,
         showDuration: false,
         showSpeed: false,
         showTokenBreakdown: true,
@@ -54,9 +59,16 @@ export const DEFAULT_CONFIG = {
         showResetLabel: true,
         usageCompact: false,
         showTools: false,
+        showSkills: false,
+        showMcp: false,
+        toolNameMaxLength: 0,
+        toolsMaxVisible: 4,
         showAgents: false,
         showTodos: false,
         showSessionName: false,
+        showAuth: false,
+        showAuthUser: false,
+        authUserLength: 8,
         showClaudeCodeVersion: false,
         showEffortLevel: false,
         showMemoryUsage: false,
@@ -66,6 +78,7 @@ export const DEFAULT_CONFIG = {
         showOutputStyle: false,
         showSessionStartDate: false,
         showLastResponseAt: false,
+        showCompactions: false,
         mergeGroups: DEFAULT_MERGE_GROUPS.map(group => [...group]),
         autocompactBuffer: 'enabled',
         contextWarningThreshold: 70,
@@ -74,11 +87,19 @@ export const DEFAULT_CONFIG = {
         sevenDayThreshold: 80,
         environmentThreshold: 0,
         externalUsagePath: '',
+        externalUsageWritePath: '',
         externalUsageFreshnessMs: 300000,
         modelFormat: 'full',
         modelOverride: '',
+        modelSource: 'stdin',
+        showProvider: false,
+        providerName: '',
         customLine: '',
+        customLinePosition: 'last',
         timeFormat: 'relative',
+        showAdvisor: false,
+        advisorOverride: '',
+        autoCompactWindow: null,
     },
     colors: {
         context: 'green',
@@ -119,13 +140,20 @@ function validateUsageValue(value) {
     return value === 'percent' || value === 'remaining';
 }
 function validateLanguage(value) {
-    return value === 'en' || value === 'zh';
+    return value === 'en' || value === 'zh' || value === 'zh-Hans' || value === 'zh-Hant' || value === 'zh-TW';
 }
 function validateModelFormat(value) {
     return value === 'full' || value === 'compact' || value === 'short';
 }
 function validateTimeFormat(value) {
-    return value === 'relative' || value === 'absolute' || value === 'both';
+    return value === 'relative'
+        || value === 'absolute'
+        || value === 'both'
+        || value === 'elapsed'
+        || value === 'elapsedAndAbsolute';
+}
+function validateCustomLinePosition(value) {
+    return value === 'first' || value === 'last';
 }
 function validateColorName(value) {
     return value === 'dim'
@@ -246,10 +274,10 @@ function migrateConfig(userConfig) {
     }
     return migrated;
 }
-function validateThreshold(value, max = 100) {
-    if (typeof value !== 'number')
-        return 0;
-    return Math.max(0, Math.min(max, value));
+function validateThreshold(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return fallback;
+    return Math.max(0, Math.min(100, value));
 }
 function validateContextThreshold(value, fallback) {
     if (typeof value !== 'number' || !Number.isFinite(value))
@@ -267,6 +295,18 @@ function validateDurationSeconds(value, fallback) {
         return fallback;
     }
     return Math.floor(value);
+}
+function validateNonNegativeInteger(value, fallback) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        return fallback;
+    }
+    return value;
+}
+function validateAutoCompactWindow(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+        return null;
+    }
+    return value;
 }
 function validateOptionalPath(value) {
     return typeof value === 'string' ? value.trim() : '';
@@ -343,6 +383,9 @@ export function mergeConfig(userConfig) {
         showCost: typeof migrated.display?.showCost === 'boolean'
             ? migrated.display.showCost
             : DEFAULT_CONFIG.display.showCost,
+        showRoutedCost: typeof migrated.display?.showRoutedCost === 'boolean'
+            ? migrated.display.showRoutedCost
+            : DEFAULT_CONFIG.display.showRoutedCost,
         showDuration: typeof migrated.display?.showDuration === 'boolean'
             ? migrated.display.showDuration
             : DEFAULT_CONFIG.display.showDuration,
@@ -370,6 +413,14 @@ export function mergeConfig(userConfig) {
         showTools: typeof migrated.display?.showTools === 'boolean'
             ? migrated.display.showTools
             : DEFAULT_CONFIG.display.showTools,
+        showSkills: typeof migrated.display?.showSkills === 'boolean'
+            ? migrated.display.showSkills
+            : DEFAULT_CONFIG.display.showSkills,
+        showMcp: typeof migrated.display?.showMcp === 'boolean'
+            ? migrated.display.showMcp
+            : DEFAULT_CONFIG.display.showMcp,
+        toolNameMaxLength: validateNonNegativeInteger(migrated.display?.toolNameMaxLength, DEFAULT_CONFIG.display.toolNameMaxLength),
+        toolsMaxVisible: validateNonNegativeInteger(migrated.display?.toolsMaxVisible, DEFAULT_CONFIG.display.toolsMaxVisible),
         showAgents: typeof migrated.display?.showAgents === 'boolean'
             ? migrated.display.showAgents
             : DEFAULT_CONFIG.display.showAgents,
@@ -379,6 +430,13 @@ export function mergeConfig(userConfig) {
         showSessionName: typeof migrated.display?.showSessionName === 'boolean'
             ? migrated.display.showSessionName
             : DEFAULT_CONFIG.display.showSessionName,
+        showAuth: typeof migrated.display?.showAuth === 'boolean'
+            ? migrated.display.showAuth
+            : DEFAULT_CONFIG.display.showAuth,
+        showAuthUser: typeof migrated.display?.showAuthUser === 'boolean'
+            ? migrated.display.showAuthUser
+            : DEFAULT_CONFIG.display.showAuthUser,
+        authUserLength: validateNonNegativeInteger(migrated.display?.authUserLength, DEFAULT_CONFIG.display.authUserLength),
         showClaudeCodeVersion: typeof migrated.display?.showClaudeCodeVersion === 'boolean'
             ? migrated.display.showClaudeCodeVersion
             : DEFAULT_CONFIG.display.showClaudeCodeVersion,
@@ -404,16 +462,20 @@ export function mergeConfig(userConfig) {
         showLastResponseAt: typeof migrated.display?.showLastResponseAt === 'boolean'
             ? migrated.display.showLastResponseAt
             : DEFAULT_CONFIG.display.showLastResponseAt,
+        showCompactions: typeof migrated.display?.showCompactions === 'boolean'
+            ? migrated.display.showCompactions
+            : DEFAULT_CONFIG.display.showCompactions,
         mergeGroups: validateMergeGroups(migrated.display?.mergeGroups),
         autocompactBuffer: validateAutocompactBuffer(migrated.display?.autocompactBuffer)
             ? migrated.display.autocompactBuffer
             : DEFAULT_CONFIG.display.autocompactBuffer,
         contextWarningThreshold: validateContextThreshold(migrated.display?.contextWarningThreshold, DEFAULT_CONFIG.display.contextWarningThreshold),
         contextCriticalThreshold: validateContextThreshold(migrated.display?.contextCriticalThreshold, DEFAULT_CONFIG.display.contextCriticalThreshold),
-        usageThreshold: validateThreshold(migrated.display?.usageThreshold, 100),
-        sevenDayThreshold: validateThreshold(migrated.display?.sevenDayThreshold, 100),
-        environmentThreshold: validateThreshold(migrated.display?.environmentThreshold, 100),
+        usageThreshold: validateThreshold(migrated.display?.usageThreshold, DEFAULT_CONFIG.display.usageThreshold),
+        sevenDayThreshold: validateThreshold(migrated.display?.sevenDayThreshold, DEFAULT_CONFIG.display.sevenDayThreshold),
+        environmentThreshold: validateThreshold(migrated.display?.environmentThreshold, DEFAULT_CONFIG.display.environmentThreshold),
         externalUsagePath: validateOptionalPath(migrated.display?.externalUsagePath),
+        externalUsageWritePath: validateOptionalPath(migrated.display?.externalUsageWritePath),
         externalUsageFreshnessMs: validateFreshnessMs(migrated.display?.externalUsageFreshnessMs),
         modelFormat: validateModelFormat(migrated.display?.modelFormat)
             ? migrated.display.modelFormat
@@ -421,12 +483,31 @@ export function mergeConfig(userConfig) {
         modelOverride: typeof migrated.display?.modelOverride === 'string'
             ? migrated.display.modelOverride.slice(0, 80)
             : DEFAULT_CONFIG.display.modelOverride,
+        modelSource: ['auto', 'stdin', 'transcript'].includes(migrated.display?.modelSource)
+            ? migrated.display.modelSource
+            : DEFAULT_CONFIG.display.modelSource,
+        showProvider: typeof migrated.display?.showProvider === 'boolean'
+            ? migrated.display.showProvider
+            : DEFAULT_CONFIG.display.showProvider,
+        providerName: typeof migrated.display?.providerName === 'string'
+            ? migrated.display.providerName.slice(0, 40)
+            : DEFAULT_CONFIG.display.providerName,
         customLine: typeof migrated.display?.customLine === 'string'
             ? migrated.display.customLine.slice(0, 80)
             : DEFAULT_CONFIG.display.customLine,
+        customLinePosition: validateCustomLinePosition(migrated.display?.customLinePosition)
+            ? migrated.display.customLinePosition
+            : DEFAULT_CONFIG.display.customLinePosition,
         timeFormat: validateTimeFormat(migrated.display?.timeFormat)
             ? migrated.display.timeFormat
             : DEFAULT_CONFIG.display.timeFormat,
+        showAdvisor: typeof migrated.display?.showAdvisor === 'boolean'
+            ? migrated.display.showAdvisor
+            : DEFAULT_CONFIG.display.showAdvisor,
+        advisorOverride: typeof migrated.display?.advisorOverride === 'string'
+            ? migrated.display.advisorOverride.slice(0, 80)
+            : DEFAULT_CONFIG.display.advisorOverride,
+        autoCompactWindow: validateAutoCompactWindow(migrated.display?.autoCompactWindow),
     };
     const colors = {
         context: validateColorValue(migrated.colors?.context)
@@ -481,7 +562,8 @@ export async function loadConfig() {
         const userConfig = JSON.parse(content);
         return mergeConfig(userConfig);
     }
-    catch {
+    catch (err) {
+        debug('Failed to load config from %s, using defaults:', configPath, err instanceof Error ? err.message : err);
         return mergeConfig({});
     }
 }

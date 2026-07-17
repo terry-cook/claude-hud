@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../dist/config.js";
 import { setLanguage } from "../dist/i18n/index.js";
 import { formatSessionDuration, main } from "../dist/index.js";
@@ -158,7 +159,7 @@ test("index entrypoint runs when executed directly", async () => {
     process.env.CLAUDE_CONFIG_DIR = dir;
     setLanguage("en");
     const moduleUrl = new URL("../dist/index.js", import.meta.url);
-    process.argv[1] = new URL(moduleUrl).pathname;
+    process.argv[1] = fileURLToPath(moduleUrl);
     Object.defineProperty(process.stdin, "isTTY", {
       value: true,
       configurable: true,
@@ -389,6 +390,89 @@ test("main prefers stdin usage over external usage fallback", async () => {
   });
 });
 
+test("main appends external balance label to stdin usage when snapshot path is configured", async () => {
+  let renderedContext;
+  let externalCalls = 0;
+
+  await main({
+    readStdin: async () => makeStdin({
+      rate_limits: {
+        five_hour: { used_percentage: 21.9, resets_at: 1710000000 },
+        seven_day: { used_percentage: 55.2, resets_at: 1710600000 },
+      },
+    }),
+    parseTranscript: async () => makeTranscript(),
+    countConfigs: async () => makeCounts(),
+    loadConfig: async () => makeConfig({
+      display: { externalUsagePath: "/tmp/usage.json" },
+    }),
+    getGitStatus: async () => null,
+    getUsageFromExternalSnapshot: () => {
+      externalCalls += 1;
+      return {
+        fiveHour: 99,
+        sevenDay: 99,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        balanceLabel: "$12.34 / $20.00",
+      };
+    },
+    render: (ctx) => {
+      renderedContext = ctx;
+    },
+  });
+
+  assert.equal(externalCalls, 1);
+  assert.deepEqual(renderedContext?.usageData, {
+    fiveHour: 22,
+    sevenDay: 55,
+    fiveHourResetAt: new Date(1710000000 * 1000),
+    sevenDayResetAt: new Date(1710600000 * 1000),
+    balanceLabel: "$12.34 / $20.00",
+  });
+});
+
+test("main fills missing seven-day usage from external snapshot", async () => {
+  let renderedContext;
+  let externalCalls = 0;
+
+  await main({
+    readStdin: async () => makeStdin({
+      rate_limits: {
+        five_hour: { used_percentage: 21.9, resets_at: 1710000000 },
+      },
+    }),
+    parseTranscript: async () => makeTranscript(),
+    countConfigs: async () => makeCounts(),
+    loadConfig: async () => makeConfig({
+      display: { externalUsagePath: "/tmp/usage.json" },
+    }),
+    getGitStatus: async () => null,
+    getUsageFromExternalSnapshot: () => {
+      externalCalls += 1;
+      return {
+        fiveHour: 99,
+        sevenDay: 85,
+        fiveHourResetAt: null,
+        sevenDayResetAt: new Date("2026-04-27T12:00:00.000Z"),
+        balanceLabel: "$12.34 / $20.00",
+      };
+    },
+    render: (ctx) => {
+      renderedContext = ctx;
+    },
+  });
+
+  assert.equal(externalCalls, 1);
+  assert.deepEqual(renderedContext?.usageData, {
+    fiveHour: 22,
+    sevenDay: 85,
+    fiveHourResetAt: new Date(1710000000 * 1000),
+    sevenDayResetAt: new Date("2026-04-27T12:00:00.000Z"),
+    balanceLabel: "$12.34 / $20.00",
+  });
+});
+
 test("main skips all usage loading when usage display is disabled", async () => {
   let renderedContext;
   let externalCalls = 0;
@@ -516,4 +600,54 @@ test("main skips memoryUsage lookup for compact layout even when enabled", async
   });
 
   assert.equal(lookupCalls, 0);
+});
+
+test("main reads auth info only when an auth segment is enabled", async () => {
+  let renderedContext;
+  let lookupCalls = 0;
+
+  await main({
+    readStdin: async () => makeStdin(),
+    parseTranscript: async () => makeTranscript(),
+    countConfigs: async () => makeCounts(),
+    loadConfig: async () => makeConfig({
+      display: { showAuth: true, showAuthUser: false },
+    }),
+    getGitStatus: async () => null,
+    readAuthInfo: () => {
+      lookupCalls += 1;
+      return { method: "API Key", user: null };
+    },
+    render: (ctx) => {
+      renderedContext = ctx;
+    },
+  });
+
+  assert.equal(lookupCalls, 1);
+  assert.deepEqual(renderedContext?.authInfo, { method: "API Key", user: null });
+});
+
+test("main skips auth file I/O when auth segments are disabled", async () => {
+  let renderedContext;
+  let lookupCalls = 0;
+
+  await main({
+    readStdin: async () => makeStdin(),
+    parseTranscript: async () => makeTranscript(),
+    countConfigs: async () => makeCounts(),
+    loadConfig: async () => makeConfig({
+      display: { showAuth: false, showAuthUser: false },
+    }),
+    getGitStatus: async () => null,
+    readAuthInfo: () => {
+      lookupCalls += 1;
+      return { method: "API Key", user: null };
+    },
+    render: (ctx) => {
+      renderedContext = ctx;
+    },
+  });
+
+  assert.equal(lookupCalls, 0);
+  assert.equal(renderedContext?.authInfo, null);
 });

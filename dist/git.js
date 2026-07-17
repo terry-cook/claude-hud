@@ -1,14 +1,16 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createDebug } from './debug.js';
+const debug = createDebug('git');
 const execFileAsync = promisify(execFile);
 export async function getGitBranch(cwd) {
     if (!cwd)
         return null;
     try {
-        const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeout: 1000, encoding: 'utf8' });
-        return stdout.trim() || null;
+        return await resolveGitRef(cwd);
     }
-    catch {
+    catch (err) {
+        debug('Failed to get git branch:', err instanceof Error ? err.message : err);
         return null;
     }
 }
@@ -17,8 +19,7 @@ export async function getGitStatus(cwd) {
         return null;
     try {
         // Get branch name
-        const { stdout: branchOut } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeout: 1000, encoding: 'utf8' });
-        const branch = branchOut.trim();
+        const branch = await resolveGitRef(cwd);
         if (!branch)
             return null;
         // Check for dirty state and parse file stats
@@ -26,20 +27,20 @@ export async function getGitStatus(cwd) {
         let fileStats;
         let lineDiff;
         try {
-            const { stdout: statusOut } = await execFileAsync('git', ['-c', 'core.quotePath=false', '--no-optional-locks', 'status', '--porcelain'], { cwd, timeout: 1000, encoding: 'utf8' });
+            const { stdout: statusOut } = await execFileAsync('git', ['-c', 'core.quotePath=false', '--no-optional-locks', 'status', '--porcelain'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
             const trimmed = statusOut.trim();
             isDirty = trimmed.length > 0;
             if (isDirty) {
                 fileStats = parseFileStats(trimmed);
             }
         }
-        catch {
-            // Ignore errors, assume clean
+        catch (err) {
+            debug('Failed to get git status:', err instanceof Error ? err.message : err);
         }
         // Get per-file and total line diffs
         if (isDirty) {
             try {
-                const { stdout: numstatOut } = await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--numstat', 'HEAD'], { cwd, timeout: 2000, encoding: 'utf8' });
+                const { stdout: numstatOut } = await execFileAsync('git', ['-c', 'core.quotePath=false', 'diff', '--numstat', 'HEAD'], { cwd, timeout: 2000, encoding: 'utf8', windowsHide: true });
                 const trackedPaths = new Set(fileStats?.trackedFiles.map((file) => file.fullPath) ?? []);
                 const { totalDiff, perFileDiff } = parseNumstat(numstatOut, trackedPaths);
                 lineDiff = totalDiff;
@@ -47,45 +48,75 @@ export async function getGitStatus(cwd) {
                     applyLineDiffsToFiles(fileStats.trackedFiles, perFileDiff);
                 }
             }
-            catch {
-                // Ignore errors
+            catch (err) {
+                debug('Failed to get line diff:', err instanceof Error ? err.message : err);
             }
         }
         // Get ahead/behind counts
         let ahead = 0;
         let behind = 0;
         try {
-            const { stdout: revOut } = await execFileAsync('git', ['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], { cwd, timeout: 1000, encoding: 'utf8' });
+            const { stdout: revOut } = await execFileAsync('git', ['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
             const parts = revOut.trim().split(/\s+/);
             if (parts.length === 2) {
                 behind = parseInt(parts[0], 10) || 0;
                 ahead = parseInt(parts[1], 10) || 0;
             }
         }
-        catch {
-            // No upstream or error, keep 0/0
+        catch (err) {
+            debug('Failed to get ahead/behind (no upstream?):', err instanceof Error ? err.message : err);
         }
         // Build GitHub branch URL from remote
         let branchUrl;
         try {
-            const { stdout: remoteOut } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd, timeout: 1000, encoding: 'utf8' });
+            const { stdout: remoteOut } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
             const remote = remoteOut.trim();
             const httpsBase = remote
                 .replace(/^git@github\.com:/, 'https://github.com/')
                 .replace(/^ssh:\/\/git@github\.com\//, 'https://github.com/')
                 .replace(/\.git$/, '');
             if (httpsBase.startsWith('https://github.com/')) {
-                branchUrl = `${httpsBase}/tree/${encodeURIComponent(branch)}`;
+                branchUrl = buildGitHubRefUrl(httpsBase, branch);
             }
         }
-        catch {
-            // No remote or not GitHub
+        catch (err) {
+            debug('Failed to get remote URL:', err instanceof Error ? err.message : err);
         }
         return { branch, isDirty, ahead, behind, fileStats, lineDiff, branchUrl };
     }
-    catch {
+    catch (err) {
+        debug('getGitStatus failed:', err instanceof Error ? err.message : err);
         return null;
     }
+}
+async function resolveGitRef(cwd) {
+    const { stdout: branchOut } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
+    const branch = branchOut.trim();
+    if (branch && branch !== 'HEAD') {
+        return branch;
+    }
+    try {
+        const { stdout: tagOut } = await execFileAsync('git', ['describe', '--tags', '--exact-match', 'HEAD'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
+        const tag = tagOut.trim();
+        if (tag)
+            return tag;
+    }
+    catch {
+        // Detached commits often are not tagged; fall back to a short commit id.
+    }
+    const { stdout: shortShaOut } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd, timeout: 1000, encoding: 'utf8', windowsHide: true });
+    const shortSha = shortShaOut.trim();
+    return shortSha ? `detached:${shortSha}` : null;
+}
+function encodeGitHubRef(ref) {
+    return ref.split('/').map(encodeURIComponent).join('/');
+}
+function buildGitHubRefUrl(httpsBase, ref) {
+    const detachedMatch = ref.match(/^detached:([0-9a-f]+)$/);
+    if (detachedMatch) {
+        return `${httpsBase}/commit/${detachedMatch[1]}`;
+    }
+    return `${httpsBase}/tree/${encodeGitHubRef(ref)}`;
 }
 /**
  * Parse git status --porcelain output and count file stats (Starship-compatible format)

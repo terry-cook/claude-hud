@@ -1,25 +1,15 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { getModelName, formatModelName, getProviderLabel } from '../../stdin.js';
+import { formatModelName, resolveModelName } from '../../stdin.js';
 import { getOutputSpeed } from '../../speed-tracker.js';
 import { git as gitColor, gitBranch as gitBranchColor, warning as warningColor, critical as criticalColor, label, model as modelColor, project as projectColor, red, green, yellow, dim, custom as customColor } from '../colors.js';
 import { t } from '../../i18n/index.js';
 import { renderCostEstimate } from './cost.js';
+import { renderAdvisorLine } from './advisor.js';
 import { normalizeAddedDirs, sanitize as sanitizeDisplayText, basenameOf, truncateBasename, MAX_RENDERED_ADDED_DIRS } from './added-dirs.js';
-function hyperlink(uri, text) {
-    const esc = '\x1b';
-    const st = '\\';
-    return `${esc}]8;;${uri}${esc}${st}${text}${esc}]8;;${esc}${st}`;
-}
-function getFileHref(filePath) {
-    try {
-        return pathToFileURL(path.resolve(filePath)).toString();
-    }
-    catch {
-        return null;
-    }
-}
+import { getFileHref, safeHyperlink } from '../../utils/hyperlinks.js';
+import { formatModelDisplay } from '../model-display.js';
+import { formatAuthSegment } from '../../auth.js';
 function resolvePathWithinCwd(cwd, candidatePath) {
     const resolvedCwd = path.resolve(cwd);
     const resolvedPath = path.resolve(cwd, candidatePath);
@@ -29,37 +19,18 @@ function resolvePathWithinCwd(cwd, candidatePath) {
     }
     return null;
 }
-function safeHyperlink(uri, text) {
-    if (!uri) {
-        return text;
-    }
-    const sanitizedUri = sanitizeDisplayText(uri);
-    try {
-        const parsed = new URL(sanitizedUri);
-        if (parsed.protocol !== 'https:' && parsed.protocol !== 'file:') {
-            return text;
-        }
-        return hyperlink(parsed.toString(), text);
-    }
-    catch {
-        return text;
-    }
-}
 export function renderProjectLine(ctx) {
     const display = ctx.config?.display;
     const colors = ctx.config?.colors;
     const parts = [];
+    const customLine = display?.customLine;
+    const customLinePosition = display?.customLinePosition ?? 'last';
+    if (customLine && customLinePosition === 'first') {
+        parts.push(customColor(customLine, colors));
+    }
     if (display?.showModel !== false) {
-        const model = formatModelName(getModelName(ctx.stdin), ctx.config?.display?.modelFormat, ctx.config?.display?.modelOverride);
-        const providerLabel = getProviderLabel(ctx.stdin);
-        const modelQualifier = providerLabel ?? undefined;
-        let modelDisplay = modelQualifier ? `${model} | ${modelQualifier}` : model;
-        if (ctx.effortLevel && ctx.effortSymbol) {
-            modelDisplay += ` ${ctx.effortSymbol} ${ctx.effortLevel}`;
-        }
-        else if (ctx.effortLevel) {
-            modelDisplay += ` ${ctx.effortLevel}`;
-        }
+        const model = formatModelName(resolveModelName(ctx.stdin, ctx.transcript, ctx.config?.display?.modelSource), ctx.config?.display?.modelFormat, ctx.config?.display?.modelOverride);
+        const modelDisplay = formatModelDisplay(model, ctx);
         parts.push(modelColor(`[${modelDisplay}]`, colors));
     }
     let projectPart = null;
@@ -133,6 +104,14 @@ export function renderProjectLine(ctx) {
     else if (gitPart) {
         parts.push(gitPart);
     }
+    // Advisor model sits inline with the model/project/git badge so the
+    // configured /advisor is visible on the first line at a glance.
+    if (display?.showAdvisor) {
+        const advisorPart = renderAdvisorLine(ctx);
+        if (advisorPart) {
+            parts.push(advisorPart);
+        }
+    }
     if (display?.showSessionName && ctx.transcript.sessionName) {
         parts.push(label(ctx.transcript.sessionName, colors));
     }
@@ -142,7 +121,7 @@ export function renderProjectLine(ctx) {
     if (ctx.extraLabel) {
         parts.push(label(ctx.extraLabel, colors));
     }
-    if (display?.showDuration !== false && ctx.sessionDuration) {
+    if (display?.showDuration === true && ctx.sessionDuration) {
         parts.push(label(`⏱️  ${ctx.sessionDuration}`, colors));
     }
     const costEstimate = renderCostEstimate(ctx);
@@ -155,8 +134,11 @@ export function renderProjectLine(ctx) {
             parts.push(label(`${t('format.out')}: ${speed.toFixed(1)} ${t('format.tokPerSec')}`, colors));
         }
     }
-    const customLine = display?.customLine;
-    if (customLine) {
+    const authSegment = formatAuthSegment(ctx.authInfo, display);
+    if (authSegment) {
+        parts.push(label(authSegment, colors));
+    }
+    if (customLine && customLinePosition === 'last') {
         parts.push(customColor(customLine, colors));
     }
     if (parts.length === 0) {

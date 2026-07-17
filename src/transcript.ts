@@ -1,10 +1,15 @@
-import * as fs from 'fs';
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import * as readline from 'readline';
+import * as readline from 'node:readline';
 import { createHash } from 'node:crypto';
 import { getHudPluginDir } from './claude-config-dir.js';
+import { createDebug } from './debug.js';
 import type { TranscriptData, ToolEntry, AgentEntry, TodoItem, SessionTokenUsage } from './types.js';
+import { sanitizeDisplayText } from './utils/sanitize.js';
+import { sanitizeTranscriptModel } from './model-source.js';
+
+const debug = createDebug('transcript');
 
 interface TranscriptLine {
   timestamp?: string;
@@ -14,8 +19,15 @@ interface TranscriptLine {
   content?: string;
   slug?: string;
   customTitle?: string;
+  // Top-level field stamped onto every assistant record after `/advisor` is
+  // set. Holds the canonical advisor model ID (e.g. "claude-opus-4-7").
+  advisorModel?: string;
   message?: {
-    content?: ContentBlock[];
+    id?: unknown;
+    // Usually an array of content blocks, but slash-command records (e.g.
+    // `/effort`) store their output as a raw string.
+    content?: ContentBlock[] | string;
+    model?: unknown;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -28,6 +40,11 @@ interface TranscriptLine {
     preTokens?: number;
     postTokens?: number;
     durationMs?: number;
+  };
+  // Harness state markers; `ultra_effort_enter` / `ultra_effort_exit` track
+  // entering / leaving ultracode effort.
+  attachment?: {
+    type?: string;
   };
 }
 
@@ -57,6 +74,8 @@ interface SerializedAgentEntry extends Omit<AgentEntry, 'startTime' | 'endTime'>
 
 interface SerializedTranscriptData {
   tools: SerializedToolEntry[];
+  skills: string[];
+  mcpServers: string[];
   agents: SerializedAgentEntry[];
   todos: TodoItem[];
   sessionStart?: string;
@@ -65,6 +84,10 @@ interface SerializedTranscriptData {
   sessionTokens?: SessionTokenUsage;
   lastCompactBoundaryAt?: string;
   lastCompactPostTokens?: number;
+  compactionCount?: number;
+  advisorModel?: string;
+  ultracodeActive?: boolean;
+  lastAssistantModel?: string;
 }
 
 interface TranscriptCacheFile {
@@ -74,7 +97,17 @@ interface TranscriptCacheFile {
   data: SerializedTranscriptData;
 }
 
-const TRANSCRIPT_CACHE_VERSION = 4;
+const TRANSCRIPT_CACHE_VERSION = 12;
+const MCP_TOOL_NAME_PATTERN = /^mcp__(.+?)__(.+)$/;
+const ACTIVITY_NAME_MAX_LEN = 64;
+const MESSAGE_ID_MAX_LEN = 128;
+const SEEN_MESSAGE_IDS_MAX = 4096;
+
+// Hard cap on the advisor model ID captured from the transcript. Real Claude
+// model IDs (e.g. "claude-haiku-4-5-20251001") fit comfortably under this; the
+// cap exists to prevent a malformed transcript from persisting an oversized
+// string through the JSON cache and onto every statusline refresh.
+const ADVISOR_MODEL_MAX_LEN = 64;
 
 let createReadStreamImpl: typeof fs.createReadStream = fs.createReadStream;
 
@@ -84,6 +117,22 @@ function normalizeTokenCount(value: unknown): number {
   }
 
   return Math.max(0, Math.trunc(value));
+}
+
+function normalizeMessageId(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= MESSAGE_ID_MAX_LEN
+    ? value
+    : null;
+}
+
+function rememberMessageId(seenMessageIds: Set<string>, messageId: string): void {
+  if (seenMessageIds.size >= SEEN_MESSAGE_IDS_MAX) {
+    const oldest = seenMessageIds.values().next().value;
+    if (oldest !== undefined) {
+      seenMessageIds.delete(oldest);
+    }
+  }
+  seenMessageIds.add(messageId);
 }
 
 function normalizeSessionTokens(tokens: unknown): SessionTokenUsage | undefined {
@@ -100,6 +149,43 @@ function normalizeSessionTokens(tokens: unknown): SessionTokenUsage | undefined 
   };
 }
 
+function normalizeNameList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const item of value) {
+    const name = normalizeActivityName(item);
+    if (!name || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    names.push(name);
+  }
+
+  return names;
+}
+
+function normalizeActivityName(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const sanitized = sanitizeDisplayText(value).trim();
+
+  if (!sanitized) {
+    return undefined;
+  }
+
+  if (sanitized.length <= ACTIVITY_NAME_MAX_LEN) {
+    return sanitized;
+  }
+
+  return `${sanitized.slice(0, ACTIVITY_NAME_MAX_LEN - 1)}…`;
+}
+
 function getTranscriptCachePath(transcriptPath: string, homeDir: string): string {
   const hash = createHash('sha256').update(path.resolve(transcriptPath)).digest('hex');
   return path.join(getHudPluginDir(homeDir), 'transcript-cache', `${hash}.json`);
@@ -108,7 +194,8 @@ function getTranscriptCachePath(transcriptPath: string, homeDir: string): string
 function canonicalizeTranscriptPath(transcriptPath: string): string | null {
   try {
     return fs.realpathSync(transcriptPath);
-  } catch {
+  } catch (err) {
+    debug('Failed to resolve transcript path %s:', transcriptPath, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -117,13 +204,15 @@ function readTranscriptFileState(transcriptPath: string): TranscriptFileState | 
   try {
     const stat = fs.statSync(transcriptPath);
     if (!stat.isFile()) {
+      debug('Transcript path is not a file: %s', transcriptPath);
       return null;
     }
     return {
       mtimeMs: stat.mtimeMs,
       size: stat.size,
     };
-  } catch {
+  } catch (err) {
+    debug('Failed to stat transcript file %s:', transcriptPath, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -135,6 +224,8 @@ function serializeTranscriptData(data: TranscriptData): SerializedTranscriptData
       startTime: tool.startTime.toISOString(),
       endTime: tool.endTime?.toISOString(),
     })),
+    skills: [...data.skills],
+    mcpServers: [...data.mcpServers],
     agents: data.agents.map((agent) => ({
       ...agent,
       startTime: agent.startTime.toISOString(),
@@ -147,6 +238,10 @@ function serializeTranscriptData(data: TranscriptData): SerializedTranscriptData
     sessionTokens: data.sessionTokens,
     lastCompactBoundaryAt: data.lastCompactBoundaryAt?.toISOString(),
     lastCompactPostTokens: data.lastCompactPostTokens,
+    compactionCount: data.compactionCount,
+    advisorModel: data.advisorModel,
+    ultracodeActive: data.ultracodeActive,
+    lastAssistantModel: sanitizeTranscriptModel(data.lastAssistantModel),
   };
 }
 
@@ -157,6 +252,8 @@ function deserializeTranscriptData(data: SerializedTranscriptData): TranscriptDa
       startTime: new Date(tool.startTime),
       endTime: tool.endTime ? new Date(tool.endTime) : undefined,
     })),
+    skills: normalizeNameList(data.skills),
+    mcpServers: normalizeNameList(data.mcpServers),
     agents: data.agents.map((agent) => ({
       ...agent,
       startTime: new Date(agent.startTime),
@@ -169,6 +266,14 @@ function deserializeTranscriptData(data: SerializedTranscriptData): TranscriptDa
     sessionTokens: normalizeSessionTokens(data.sessionTokens),
     lastCompactBoundaryAt: data.lastCompactBoundaryAt ? new Date(data.lastCompactBoundaryAt) : undefined,
     lastCompactPostTokens: typeof data.lastCompactPostTokens === 'number' ? data.lastCompactPostTokens : undefined,
+    compactionCount: typeof data.compactionCount === 'number' && Number.isFinite(data.compactionCount) && data.compactionCount >= 0
+      ? Math.trunc(data.compactionCount)
+      : undefined,
+    advisorModel: typeof data.advisorModel === 'string' && data.advisorModel.length > 0
+      ? data.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN)
+      : undefined,
+    ultracodeActive: typeof data.ultracodeActive === 'boolean' ? data.ultracodeActive : undefined,
+    lastAssistantModel: sanitizeTranscriptModel(data.lastAssistantModel),
   };
 }
 
@@ -189,7 +294,8 @@ function readTranscriptCache(transcriptPath: string, state: TranscriptFileState)
     }
 
     return deserializeTranscriptData(parsed.data);
-  } catch {
+  } catch (err) {
+    debug('Failed to read transcript cache:', err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -197,7 +303,13 @@ function readTranscriptCache(transcriptPath: string, state: TranscriptFileState)
 function writeTranscriptCache(transcriptPath: string, state: TranscriptFileState, data: TranscriptData): void {
   try {
     const cachePath = getTranscriptCachePath(transcriptPath, os.homedir());
-    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    const cacheDir = path.dirname(cachePath);
+    fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(cacheDir, 0o700);
+    } catch {
+      // Best-effort: some filesystems do not support POSIX modes.
+    }
     const payload: TranscriptCacheFile = {
       version: TRANSCRIPT_CACHE_VERSION,
       transcriptPath: path.resolve(transcriptPath),
@@ -205,14 +317,21 @@ function writeTranscriptCache(transcriptPath: string, state: TranscriptFileState
       data: serializeTranscriptData(data),
     };
     fs.writeFileSync(cachePath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
-  } catch {
-    // Cache failures are non-fatal; fall back to fresh parsing next time.
+    try {
+      fs.chmodSync(cachePath, 0o600);
+    } catch {
+      // Best-effort: cache permissions should not break rendering.
+    }
+  } catch (err) {
+    debug('Failed to write transcript cache:', err instanceof Error ? err.message : err);
   }
 }
 
 export async function parseTranscript(transcriptPath: string): Promise<TranscriptData> {
   const result: TranscriptData = {
     tools: [],
+    skills: [],
+    mcpServers: [],
     agents: [],
     todos: [],
   };
@@ -237,20 +356,27 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
   }
 
   const toolMap = new Map<string, ToolEntry>();
+  const skillSet = new Set<string>();
+  const mcpServerSet = new Set<string>();
   const agentMap = new Map<string, AgentEntry>();
   let latestTodos: TodoItem[] = [];
   const taskIdToIndex = new Map<string, number>();
   const queueCompletionMap = new Map<string, Date>();
   let latestSlug: string | undefined;
   let customTitle: string | undefined;
+  let latestAdvisorModel: string | undefined;
+  let latestUltracodeActive: boolean | undefined;
   let lastCompactBoundaryAt: Date | undefined;
   let lastCompactPostTokens: number | undefined;
+  let compactionCount = 0;
   const sessionTokens: SessionTokenUsage = {
     inputTokens: 0,
     outputTokens: 0,
     cacheCreationTokens: 0,
     cacheReadTokens: 0,
   };
+  const seenMessageIds = new Set<string>();
+  let lastUsageKey: string | undefined;
 
   let parsedCleanly = false;
 
@@ -262,7 +388,10 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
     });
 
     for await (const line of rl) {
-      if (!line.trim()) continue;
+      if (!line.trim()) {
+        lastUsageKey = undefined;
+        continue;
+      }
 
       try {
         const entry = JSON.parse(line) as TranscriptLine;
@@ -271,13 +400,85 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
         } else if (typeof entry.slug === 'string') {
           latestSlug = entry.slug;
         }
-        // Accumulate token usage from assistant messages
+        // Capture the advisor model from the top-level `advisorModel` field.
+        // Claude Code stamps this onto every *assistant* record after `/advisor`
+        // is set, so we restrict to that record type (matching the documented
+        // source) and the most recent occurrence reflects the current choice.
+        // Length is hard-capped so a malformed transcript cannot persist an
+        // unbounded value through the cache layer.
+        if (
+          entry.type === 'assistant'
+          && typeof entry.advisorModel === 'string'
+          && entry.advisorModel.length > 0
+        ) {
+          latestAdvisorModel = entry.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN);
+        }
+        // Current ultracode state, distinguishable only from the transcript
+        // (stdin reports it as plain `xhigh`). Two signals update this in file
+        // order, last wins: the self-correcting ultra_effort_enter/exit
+        // attachment (can lag a turn) and the immediate `/effort` command output.
+        if (entry.type === 'attachment') {
+          const attachmentType = entry.attachment?.type;
+          if (attachmentType === 'ultra_effort_enter') {
+            latestUltracodeActive = true;
+          } else if (attachmentType === 'ultra_effort_exit') {
+            latestUltracodeActive = false;
+          }
+        }
+        // The `/effort` command-output signal. Anchored at the start of a *user*
+        // record's string content, so prose quoting the phrase can't flip state.
+        // Brittle by necessity — couples to Claude Code's /effort wording; if that
+        // changes, the label falls back to the (laggier) attachments.
+        if (entry.type === 'user' && typeof entry.message?.content === 'string') {
+          const effortCommandMatch = entry.message.content.match(
+            /^<local-command-stdout>Set effort level to (\w+)/,
+          );
+          if (effortCommandMatch) {
+            latestUltracodeActive = effortCommandMatch[1].toLowerCase() === 'ultracode';
+          }
+        }
+        // Capture the actual model from the assistant message's `model` field.
+        // This reflects what the API actually served, which may differ from the
+        // model Claude Code thinks it's using (e.g. proxy redirect via cc-switch).
+        if (entry.type === 'assistant') {
+          const transcriptModel = sanitizeTranscriptModel(entry.message?.model);
+          if (transcriptModel) {
+            result.lastAssistantModel = transcriptModel;
+          }
+        }
+        // Accumulate token usage from assistant messages.
+        // Claude Code can write the same API response to the transcript 2-3 times
+        // (dual-logging). Prefer the API-response-level message.id so duplicates
+        // can be removed even when another record appears between them. Only
+        // bounded string IDs are retained, and the set is capped to keep a
+        // malformed transcript from growing memory without limit. Records with
+        // missing or invalid IDs keep the previous consecutive usage-fingerprint
+        // fallback.
         if (entry.type === 'assistant' && entry.message?.usage) {
           const usage = entry.message.usage;
-          sessionTokens.inputTokens += normalizeTokenCount(usage.input_tokens);
-          sessionTokens.outputTokens += normalizeTokenCount(usage.output_tokens);
-          sessionTokens.cacheCreationTokens += normalizeTokenCount(usage.cache_creation_input_tokens);
-          sessionTokens.cacheReadTokens += normalizeTokenCount(usage.cache_read_input_tokens);
+          const msgId = normalizeMessageId(entry.message.id);
+          let shouldCount = false;
+
+          if (msgId !== null) {
+            lastUsageKey = undefined;
+            if (!seenMessageIds.has(msgId)) {
+              rememberMessageId(seenMessageIds, msgId);
+              shouldCount = true;
+            }
+          } else {
+            const usageKey = `${usage.input_tokens}|${usage.output_tokens}|${usage.cache_creation_input_tokens}|${usage.cache_read_input_tokens}`;
+            shouldCount = usageKey !== lastUsageKey;
+            lastUsageKey = usageKey;
+          }
+
+          if (shouldCount) {
+            sessionTokens.inputTokens += normalizeTokenCount(usage.input_tokens);
+            sessionTokens.outputTokens += normalizeTokenCount(usage.output_tokens);
+            sessionTokens.cacheCreationTokens += normalizeTokenCount(usage.cache_creation_input_tokens);
+            sessionTokens.cacheReadTokens += normalizeTokenCount(usage.cache_read_input_tokens);
+          }
+        } else {
+          lastUsageKey = undefined;
         }
         // Track Claude Code's compact_boundary marker. Both manual (/compact)
         // and auto compaction emit this system entry with compactMetadata; we
@@ -286,6 +487,7 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
         if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           const ts = entry.timestamp ? new Date(entry.timestamp) : null;
           if (ts && !Number.isNaN(ts.getTime())) {
+            compactionCount += 1;
             if (!lastCompactBoundaryAt || ts.getTime() > lastCompactBoundaryAt.getTime()) {
               lastCompactBoundaryAt = ts;
               const post = entry.compactMetadata?.postTokens;
@@ -308,15 +510,16 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
             }
           }
         }
-        processEntry(entry, toolMap, agentMap, taskIdToIndex, latestTodos, result);
-      } catch {
-        // Skip malformed lines
+        processEntry(entry, toolMap, skillSet, mcpServerSet, agentMap, taskIdToIndex, latestTodos, result);
+      } catch (err) {
+        lastUsageKey = undefined;
+        debug('Skipping malformed transcript line:', err instanceof Error ? err.message : err);
       }
     }
 
     parsedCleanly = true;
-  } catch {
-    // Return partial results on error
+  } catch (err) {
+    debug('Transcript stream read error, returning partial results:', err instanceof Error ? err.message : err);
   }
 
   // Resolve agent completion: prefer queue-operation timestamps (accurate for
@@ -335,12 +538,17 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
     }
   }
   result.tools = Array.from(toolMap.values()).slice(-20);
+  result.skills = Array.from(skillSet.values());
+  result.mcpServers = Array.from(mcpServerSet.values());
   result.agents = Array.from(agentMap.values()).slice(-10);
   result.todos = latestTodos;
   result.sessionName = customTitle ?? latestSlug;
   result.sessionTokens = sessionTokens;
   result.lastCompactBoundaryAt = lastCompactBoundaryAt;
   result.lastCompactPostTokens = lastCompactPostTokens;
+  result.compactionCount = compactionCount;
+  result.advisorModel = latestAdvisorModel;
+  result.ultracodeActive = latestUltracodeActive;
   if (parsedCleanly) {
     writeTranscriptCache(canonicalTranscriptPath, transcriptState, result);
   }
@@ -355,6 +563,8 @@ export function _setCreateReadStreamForTests(impl: typeof fs.createReadStream | 
 function processEntry(
   entry: TranscriptLine,
   toolMap: Map<string, ToolEntry>,
+  skillSet: Set<string>,
+  mcpServerSet: Set<string>,
   agentMap: Map<string, AgentEntry>,
   taskIdToIndex: Map<string, number>,
   latestTodos: TodoItem[],
@@ -376,6 +586,18 @@ function processEntry(
 
   for (const block of content) {
     if (block.type === 'tool_use' && block.id && block.name) {
+      const skillName = block.name === 'Skill'
+        ? normalizeSkillName(block.input?.skill)
+        : undefined;
+      if (skillName) {
+        skillSet.add(skillName);
+      }
+
+      const mcpServerName = extractMcpServerName(block.name);
+      if (mcpServerName) {
+        mcpServerSet.add(mcpServerName);
+      }
+
       const toolEntry: ToolEntry = {
         id: block.id,
         name: block.name,
@@ -499,14 +721,32 @@ function extractTarget(toolName: string, input?: Record<string, unknown>): strin
     case 'Grep':
       return input.pattern as string;
     case 'Skill':
-      return typeof input.skill === 'string' && input.skill.trim().length > 0
-        ? input.skill
-        : undefined;
+      return normalizeSkillName(input.skill);
     case 'Bash':
-      const cmd = input.command as string;
-      return cmd?.slice(0, 30) + (cmd?.length > 30 ? '...' : '');
+      if (typeof input.command !== 'string') {
+        return undefined;
+      }
+      const cmd = input.command.replace(/\s+/g, ' ').trim();
+      return cmd
+        ? cmd.length > 30
+          ? `${cmd.slice(0, 30).trimEnd()}...`
+          : cmd
+        : undefined;
   }
   return undefined;
+}
+
+function normalizeSkillName(value: unknown): string | undefined {
+  return normalizeActivityName(value);
+}
+
+function extractMcpServerName(toolName: string): string | undefined {
+  const match = MCP_TOOL_NAME_PATTERN.exec(toolName);
+  if (!match) {
+    return undefined;
+  }
+
+  return normalizeActivityName(match[1]);
 }
 
 function resolveTaskIndex(

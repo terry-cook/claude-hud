@@ -4,6 +4,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { getHudPluginDir } from './claude-config-dir.js';
+import { createDebug } from './debug.js';
+
+const debug = createDebug('version');
 
 type ExecFileResult = {
   stdout: string;
@@ -15,6 +18,7 @@ type ExecFileImpl = (
   options: {
     timeout: number;
     encoding: BufferEncoding;
+    windowsHide?: boolean;
   }
 ) => Promise<ExecFileResult>;
 
@@ -78,7 +82,8 @@ function statResolvedBinary(binaryPath: string): ClaudeBinaryInfo | null {
       path: realPath,
       mtimeMs: stat.mtimeMs,
     };
-  } catch {
+  } catch (err) {
+    debug('Failed to stat binary %s:', binaryPath, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -102,7 +107,8 @@ function readVersionCache(homeDir: string): VersionCacheFile | null {
     }
 
     return parsed;
-  } catch {
+  } catch (err) {
+    debug('Failed to read version cache:', err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -112,12 +118,22 @@ function writeVersionCache(homeDir: string, cache: VersionCacheFile): void {
     const cachePath = getVersionCachePath(homeDir);
     const cacheDir = path.dirname(cachePath);
     if (!fs.existsSync(cacheDir)) {
-      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+    }
+    try {
+      fs.chmodSync(cacheDir, 0o700);
+    } catch {
+      // Best-effort: some filesystems do not support POSIX modes.
     }
 
-    fs.writeFileSync(cachePath, JSON.stringify(cache), 'utf8');
-  } catch {
-    // Ignore cache write failures.
+    fs.writeFileSync(cachePath, JSON.stringify(cache), { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.chmodSync(cachePath, 0o600);
+    } catch {
+      // Best-effort: version cache permissions should not affect rendering.
+    }
+  } catch (err) {
+    debug('Failed to write version cache:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -134,7 +150,8 @@ function isExecutableFile(candidatePath: string): boolean {
 
     fs.accessSync(candidatePath, fs.constants.X_OK);
     return true;
-  } catch {
+  } catch (err) {
+    debug('Binary candidate not executable %s:', candidatePath, err instanceof Error ? err.message : err);
     return false;
   }
 }
@@ -263,9 +280,11 @@ export async function getClaudeCodeVersion(): Promise<string | undefined> {
     const { stdout } = await execFileImpl(invocation.file, invocation.args, {
       timeout: 2000,
       encoding: 'utf8',
+      windowsHide: true,
     });
     cachedVersion = _parseClaudeCodeVersion(stdout);
-  } catch {
+  } catch (err) {
+    debug('Failed to execute claude --version:', err instanceof Error ? err.message : err);
     cachedVersion = undefined;
   }
 

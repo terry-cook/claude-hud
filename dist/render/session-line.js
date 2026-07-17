@@ -1,26 +1,34 @@
 import { isLimitReached } from '../types.js';
-import { getContextPercent, getBufferedPercent, getModelName, formatModelName, getProviderLabel, getTotalTokens, shouldHideUsage } from '../stdin.js';
+import { getContextPercent, getBufferedPercent, formatModelName, resolveModelName, shouldHideUsage } from '../stdin.js';
 import { getOutputSpeed } from '../speed-tracker.js';
 import { coloredBar, critical, git as gitColor, gitBranch as gitBranchColor, label, model as modelColor, project as projectColor, getContextColor, getQuotaColor, quotaBar, custom as customColor, RESET } from './colors.js';
 import { getAdaptiveBarWidth } from '../utils/terminal.js';
 import { renderCostEstimate } from './lines/cost.js';
 import { renderPromptCacheLine } from './lines/prompt-cache.js';
 import { renderSessionTimeLine } from './lines/session-time.js';
+import { renderAdvisorLine } from './lines/advisor.js';
 import { t } from '../i18n/index.js';
 import { formatResetTime } from './format-reset-time.js';
-const DEBUG = process.env.DEBUG?.includes('claude-hud') || process.env.DEBUG === '*';
+import { formatTokens, formatContextValue } from '../utils/format.js';
+import { formatAuthSegment } from '../auth.js';
+import { createDebug } from '../debug.js';
+import { formatModelDisplay } from './model-display.js';
+import { formatSessionTokenSummary } from './lines/session-tokens.js';
+import { sanitizeDisplayText } from '../utils/sanitize.js';
+const debug = createDebug('session-line');
 /**
  * Renders the full session line (model + context bar + project + git + counts + usage + duration).
  * Used for compact layout mode.
  */
 export function renderSessionLine(ctx) {
-    const model = formatModelName(getModelName(ctx.stdin), ctx.config?.display?.modelFormat, ctx.config?.display?.modelOverride);
-    const rawPercent = getContextPercent(ctx.stdin);
-    const bufferedPercent = getBufferedPercent(ctx.stdin);
+    const model = formatModelName(resolveModelName(ctx.stdin, ctx.transcript, ctx.config?.display?.modelSource), ctx.config?.display?.modelFormat, ctx.config?.display?.modelOverride);
+    const autoCompactWindow = ctx.config?.display?.autoCompactWindow ?? null;
+    const rawPercent = getContextPercent(ctx.stdin, autoCompactWindow);
+    const bufferedPercent = getBufferedPercent(ctx.stdin, autoCompactWindow);
     const autocompactMode = ctx.config?.display?.autocompactBuffer ?? 'enabled';
     const percent = autocompactMode === 'disabled' ? rawPercent : bufferedPercent;
-    if (DEBUG && autocompactMode === 'disabled') {
-        console.error(`[claude-hud:context] autocompactBuffer=disabled, showing raw ${rawPercent}% (buffered would be ${bufferedPercent}%)`);
+    if (autocompactMode === 'disabled') {
+        debug(`autocompactBuffer=disabled, showing raw ${rawPercent}% (buffered would be ${bufferedPercent}%)`);
     }
     const colors = ctx.config?.colors;
     const display = ctx.config?.display;
@@ -36,16 +44,13 @@ export function renderSessionLine(ctx) {
     const contextValueMode = display?.contextValue ?? 'percent';
     const contextValue = formatContextValue(ctx, percent, contextValueMode);
     const contextValueDisplay = `${getContextColor(percent, colors, contextThresholds)}${contextValue}${RESET}`;
-    // Model and context bar (FIRST)
-    const providerLabel = getProviderLabel(ctx.stdin);
-    const modelQualifier = providerLabel ?? undefined;
-    let modelDisplay = modelQualifier ? `${model} | ${modelQualifier}` : model;
-    if (ctx.effortLevel && ctx.effortSymbol) {
-        modelDisplay += ` ${ctx.effortSymbol} ${ctx.effortLevel}`;
+    const customLine = display?.customLine;
+    const customLinePosition = display?.customLinePosition ?? 'last';
+    if (customLine && customLinePosition === 'first') {
+        parts.push(customColor(customLine, colors));
     }
-    else if (ctx.effortLevel) {
-        modelDisplay += ` ${ctx.effortLevel}`;
-    }
+    // Model and context bar
+    const modelDisplay = formatModelDisplay(model, ctx);
     if (display?.showModel !== false && display?.showContextBar !== false) {
         parts.push(`${modelColor(`[${modelDisplay}]`, colors)} ${bar} ${contextValueDisplay}`);
     }
@@ -58,7 +63,7 @@ export function renderSessionLine(ctx) {
     else {
         parts.push(contextValueDisplay);
     }
-    // Project path + git status (SECOND)
+    // Project path + git status
     let projectPart = null;
     if (display?.showProject !== false && ctx.stdin.cwd) {
         // Split by both Unix (/) and Windows (\) separators for cross-platform support
@@ -74,7 +79,7 @@ export function renderSessionLine(ctx) {
     const showGit = gitConfig?.enabled ?? true;
     const branchOverflow = gitConfig?.branchOverflow ?? 'truncate';
     if (showGit && ctx.gitStatus) {
-        const gitParts = [ctx.gitStatus.branch];
+        const gitParts = [sanitizeDisplayText(ctx.gitStatus.branch)];
         // Show dirty indicator
         if ((gitConfig?.showDirty ?? true) && ctx.gitStatus.isDirty) {
             gitParts.push('*');
@@ -129,7 +134,7 @@ export function renderSessionLine(ctx) {
         parts.push(label(`CC v${ctx.claudeCodeVersion}`, colors));
     }
     // Config counts (respects environmentThreshold)
-    if (display?.showConfigCounts !== false) {
+    if (display?.showConfigCounts === true) {
         const totalCounts = ctx.claudeMdCount + ctx.rulesCount + ctx.mcpCount + ctx.hooksCount;
         const envThreshold = display?.environmentThreshold ?? 0;
         if (totalCounts > 0 && totalCounts >= envThreshold) {
@@ -152,10 +157,25 @@ export function renderSessionLine(ctx) {
         const usageCompact = display?.usageCompact ?? false;
         const showResetLabel = display?.showResetLabel ?? true;
         const usageValueMode = display?.usageValue ?? 'percent';
-        if (ctx.usageData.balanceLabel) {
-            parts.push(`${label(t('label.usage'), colors)} ${ctx.usageData.balanceLabel}`);
-        }
-        else if (isLimitReached(ctx.usageData)) {
+        const scopedWindows = ctx.usageData.scopedWindows ?? [];
+        const hasGenericWindowData = ctx.usageData.fiveHour !== null || ctx.usageData.sevenDay !== null;
+        const hasWindowData = hasGenericWindowData || scopedWindows.length > 0;
+        const scopedParts = scopedWindows.map((window) => usageCompact
+            ? formatCompactWindowPart(window.label, window.percent, window.resetAt, timeFormat, colors, usageValueMode)
+            : formatUsageWindowPart({
+                label: window.label,
+                percent: window.percent,
+                resetAt: window.resetAt,
+                colors,
+                usageBarEnabled: display?.usageBarEnabled ?? true,
+                barWidth,
+                timeFormat,
+                showResetLabel,
+                forceLabel: true,
+                usageValueMode,
+                windowDurationLabel: '7d',
+            }));
+        if (isLimitReached(ctx.usageData)) {
             const resetTime = ctx.usageData.fiveHour === 100
                 ? formatResetTime(ctx.usageData.fiveHourResetAt, timeFormat)
                 : formatResetTime(ctx.usageData.sevenDayResetAt, timeFormat);
@@ -170,13 +190,14 @@ export function renderSessionLine(ctx) {
                     : '';
                 parts.push(critical(`⚠ ${t('status.limitReached')}${resetSuffix}`, colors));
             }
+            parts.push(...scopedParts);
         }
         else {
             const usageThreshold = display?.usageThreshold ?? 0;
             const fiveHour = ctx.usageData.fiveHour;
             const sevenDay = ctx.usageData.sevenDay;
-            const effectiveUsage = Math.max(fiveHour ?? 0, sevenDay ?? 0);
-            if (effectiveUsage >= usageThreshold) {
+            const effectiveUsage = Math.max(fiveHour ?? 0, sevenDay ?? 0, ...scopedWindows.map((window) => window.percent ?? 0));
+            if ((hasWindowData || !ctx.usageData.balanceLabel) && effectiveUsage >= usageThreshold) {
                 const usageBarEnabled = display?.usageBarEnabled ?? true;
                 if (usageCompact) {
                     const fiveHourPart = fiveHour !== null
@@ -196,6 +217,7 @@ export function renderSessionLine(ctx) {
                     else if (sevenDayPart) {
                         parts.push(sevenDayPart);
                     }
+                    parts.push(...scopedParts);
                 }
                 else if (fiveHour === null && sevenDay !== null) {
                     const weeklyOnlyPart = formatUsageWindowPart({
@@ -211,8 +233,9 @@ export function renderSessionLine(ctx) {
                         usageValueMode,
                     });
                     parts.push(weeklyOnlyPart);
+                    parts.push(...scopedParts);
                 }
-                else {
+                else if (hasGenericWindowData || !hasWindowData) {
                     const fiveHourPart = formatUsageWindowPart({
                         label: '5h',
                         percent: fiveHour,
@@ -244,19 +267,47 @@ export function renderSessionLine(ctx) {
                     else {
                         parts.push(`${label(t('label.usage'), colors)} ${fiveHourPart}`);
                     }
+                    parts.push(...scopedParts);
                 }
+                else if (scopedParts.length > 0) {
+                    const [firstScopedPart, ...remainingScopedParts] = scopedParts;
+                    parts.push(`${label(t('label.usage'), colors)} ${firstScopedPart}`);
+                    parts.push(...remainingScopedParts);
+                }
+            }
+        }
+        if (ctx.usageData.balanceLabel) {
+            if (!hasWindowData) {
+                parts.push(`${label(t('label.usage'), colors)} ${ctx.usageData.balanceLabel}`);
+            }
+            else {
+                parts.push(ctx.usageData.balanceLabel);
             }
         }
     }
     // Session token usage (cumulative)
     if (display?.showSessionTokens && ctx.transcript.sessionTokens) {
-        const st = ctx.transcript.sessionTokens;
-        const total = st.inputTokens + st.outputTokens + st.cacheCreationTokens + st.cacheReadTokens;
-        if (total > 0) {
-            parts.push(label(`${t('format.tok')}: ${formatTokens(total)} (${t('format.in')}: ${formatTokens(st.inputTokens)}, ${t('format.out')}: ${formatTokens(st.outputTokens)})`, colors));
+        const summary = formatSessionTokenSummary(ctx.transcript.sessionTokens, `${t('format.tok')}:`);
+        if (summary) {
+            parts.push(label(summary, colors));
         }
     }
-    if (display?.showDuration !== false && ctx.sessionDuration) {
+    // Compaction count from transcript compact_boundary entries (opt-in,
+    // hidden until the first compaction)
+    if (display?.showCompactions) {
+        const compactions = ctx.transcript.compactionCount ?? 0;
+        if (compactions > 0) {
+            parts.push(label(`${t('label.compactions')}: ${compactions}`, colors));
+        }
+    }
+    // Advisor model (when `/advisor` is configured for the session)
+    if (display?.showAdvisor) {
+        const advisorLine = renderAdvisorLine(ctx);
+        if (advisorLine) {
+            parts.push(advisorLine);
+        }
+    }
+    if (display?.showDuration === true && ctx.sessionDuration) {
         parts.push(label(`⏱️  ${ctx.sessionDuration}`, colors));
     }
     const sessionTimeLine = renderSessionTimeLine(ctx);
@@ -280,9 +331,11 @@ export function renderSessionLine(ctx) {
     if (ctx.extraLabel) {
         parts.push(label(ctx.extraLabel, colors));
     }
-    // Custom line (static user-defined text)
-    const customLine = display?.customLine;
-    if (customLine) {
+    const authSegment = formatAuthSegment(ctx.authInfo, display);
+    if (authSegment) {
+        parts.push(label(authSegment, colors));
+    }
+    if (customLine && customLinePosition === 'last') {
         parts.push(customColor(customLine, colors));
     }
     let line = parts.join(' | ');
@@ -296,35 +349,6 @@ export function renderSessionLine(ctx) {
         }
     }
     return line;
-}
-function formatTokens(n) {
-    if (n >= 1000000) {
-        return `${(n / 1000000).toFixed(1)}M`;
-    }
-    if (n >= 1000) {
-        return `${(n / 1000).toFixed(0)}k`;
-    }
-    return n.toString();
-}
-function formatContextValue(ctx, percent, mode) {
-    const totalTokens = getTotalTokens(ctx.stdin);
-    const size = ctx.stdin.context_window?.context_window_size ?? 0;
-    if (mode === 'tokens') {
-        if (size > 0) {
-            return `${formatTokens(totalTokens)}/${formatTokens(size)}`;
-        }
-        return formatTokens(totalTokens);
-    }
-    if (mode === 'both') {
-        if (size > 0) {
-            return `${percent}% (${formatTokens(totalTokens)}/${formatTokens(size)})`;
-        }
-        return `${percent}%`;
-    }
-    if (mode === 'remaining') {
-        return `${Math.max(0, 100 - percent)}%`;
-    }
-    return `${percent}%`;
 }
 function formatCompactWindowPart(windowLabel, percent, resetAt, timeFormat, colors, usageValueMode = 'percent') {
     const usageDisplay = formatUsagePercent(percent, colors, usageValueMode);
@@ -342,7 +366,7 @@ function formatUsagePercent(percent, colors, mode = 'percent') {
     const displayPercent = mode === 'remaining' ? Math.max(0, 100 - percent) : percent;
     return `${color}${displayPercent}%${RESET}`;
 }
-function formatUsageWindowPart({ label: windowLabel, percent, resetAt, colors, usageBarEnabled, barWidth, timeFormat = 'relative', showResetLabel, forceLabel = false, usageValueMode = 'percent', }) {
+function formatUsageWindowPart({ label: windowLabel, percent, resetAt, colors, usageBarEnabled, barWidth, timeFormat = 'relative', showResetLabel, forceLabel = false, usageValueMode = 'percent', windowDurationLabel, }) {
     const usageDisplay = formatUsagePercent(percent, colors, usageValueMode);
     const reset = formatResetTime(resetAt, timeFormat);
     const styledLabel = label(windowLabel, colors);
@@ -352,7 +376,7 @@ function formatUsageWindowPart({ label: windowLabel, percent, resetAt, colors, u
         // Relative mode keeps the upstream "(duration / windowLabel)" pattern (e.g. "2h 30m / 5h").
         // Absolute/both modes use the preposition form instead — "(at 14:30 / 5h)" is incoherent.
         const barReset = timeFormat === 'relative'
-            ? (reset ? `${reset} / ${windowLabel}` : null)
+            ? (reset ? `${reset} / ${windowDurationLabel ?? windowLabel}` : null)
             : (reset ? (showResetLabel ? `${t(resetsKey)} ${reset}` : reset) : null);
         const body = barReset
             ? `${quotaBar(percent ?? 0, barWidth, colors)} ${usageDisplay} (${barReset})`
